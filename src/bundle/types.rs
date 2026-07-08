@@ -195,3 +195,81 @@ pub struct SearchResult {
     pub score: f64,
     pub snippet: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BodySection {
+    pub heading: String,
+    pub content: String,
+}
+
+pub fn render_body_sections(sections: &[BodySection]) -> String {
+    let mut parts = Vec::new();
+    for section in sections {
+        if section.heading.is_empty() {
+            if !section.content.is_empty() {
+                parts.push(section.content.clone());
+            }
+        } else {
+            let rendered = format!("## {}\n{}", section.heading, section.content);
+            parts.push(rendered);
+        }
+    }
+    parts.join("\n\n")
+}
+
+pub fn parse_body_sections(body: &str) -> Vec<BodySection> {
+    let mut sections = Vec::new();
+    let mut current_heading = String::new();
+    let mut current_lines: Vec<&str> = Vec::new();
+
+    for line in body.lines() {
+        if let Some(h) = line.strip_prefix("## ") {
+            if !current_heading.is_empty() || !current_lines.is_empty() {
+                sections.push(BodySection {
+                    heading: std::mem::take(&mut current_heading),
+                    content: current_lines.join("\n").trim().to_string(),
+                });
+                current_lines.clear();
+            }
+            current_heading = h.to_string();
+        } else {
+            current_lines.push(line);
+        }
+    }
+
+    if !current_heading.is_empty() || !current_lines.is_empty() {
+        sections.push(BodySection {
+            heading: current_heading,
+            content: current_lines.join("\n").trim().to_string(),
+        });
+    }
+
+    sections
+}
+
+pub fn merge_body_sections(
+    existing: &[BodySection],
+    incoming: &[BodySection],
+) -> Vec<BodySection> {
+    let mut result: Vec<BodySection> = Vec::new();
+    let mut replaced: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for section in existing {
+        if let Some(incoming_section) = incoming.iter().find(|s| s.heading == section.heading) {
+            result.push(incoming_section.clone());
+            replaced.insert(incoming_section.heading.as_str());
+        } else {
+            result.push(section.clone());
+        }
+    }
+
+    for section in incoming {
+        if !replaced.contains(section.heading.as_str()) {
+            result.push(section.clone());
+        }
+    }
+
+    result
+}
+
+

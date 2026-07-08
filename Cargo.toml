@@ -20,6 +20,8 @@ regex = "1"
 rmcp = { version = "0.16", features = ["server", "transport-io"] }
 schemars = "1"
 git2 = "0.19"
+tantivy = "0.26"
+notify = "7"
 
 [dev-dependencies]
 tempfile = "3"

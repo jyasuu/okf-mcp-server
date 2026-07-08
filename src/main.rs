@@ -1,13 +1,7 @@
-mod audit;
-mod bundle;
-mod config;
-mod server;
-mod tools;
-
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{BundleBackend, ResolvedBundleConfig, ServerConfig};
-use crate::server::OkfServer;
+use okf_mcp_server::config::{BundleBackend, ResolvedBundleConfig, ServerConfig};
+use okf_mcp_server::server::OkfServer;
 
 #[tokio::main]
 async fn main() {
@@ -43,7 +37,7 @@ async fn main() {
             let mut bundles = std::collections::HashMap::new();
             bundles.insert(
                 bundle_name,
-                config::BundleConfig {
+                okf_mcp_server::config::BundleConfig {
                     backend: "fs".to_string(),
                     path: bundle_path,
                     remote: None,
@@ -75,7 +69,7 @@ async fn main() {
             remote: bc.remote,
             default_branch: bc.default_branch,
             branch_policy: bc.branch_policy,
-            auth: bc.auth.map(|a| crate::config::AuthConfig {
+            auth: bc.auth.map(|a| okf_mcp_server::config::AuthConfig {
                 ssh_key: a.ssh_key,
                 token_env: a.token_env,
             }),
@@ -90,11 +84,23 @@ async fn main() {
         std::process::exit(1);
     }
 
+    let search = config.search.as_ref();
+    let search_index_dir = search.and_then(|s| s.index.as_deref());
+    let enable_watch = search.and_then(|s| s.watch).unwrap_or(false);
+
     let server =
-        OkfServer::new(resolved_bundles, config.audit_dir.as_deref()).unwrap_or_else(|e| {
+        OkfServer::new(resolved_bundles, config.audit_dir.as_deref(), search_index_dir).unwrap_or_else(|e| {
             tracing::error!("Failed to create server: {e}");
             std::process::exit(1);
         });
+
+    if enable_watch {
+        if let Err(e) = server.start_file_watcher() {
+            tracing::warn!("Failed to start file watcher: {e}");
+        } else {
+            tracing::info!("File watcher started for auto-reindex");
+        }
+    }
 
     tracing::info!("OKF MCP Server started");
 

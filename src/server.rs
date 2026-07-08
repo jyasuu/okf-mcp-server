@@ -5,7 +5,7 @@ use rmcp::{
     model::*, schemars, service::RequestContext, transport, ErrorData, RoleServer, ServerHandler,
     ServiceExt,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditLog;
 use crate::bundle::fs_store::LocalFsStore;
@@ -71,8 +71,16 @@ pub struct WriteConceptArgs {
     pub bundle: String,
     pub concept_id: String,
     pub frontmatter: FrontmatterInput,
-    pub body: String,
+    pub body: Option<String>,
     pub mode: Option<String>,
+    pub body_sections: Option<Vec<BodySectionInput>>,
+    pub body_section_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BodySectionInput {
+    pub heading: String,
+    pub content: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -188,6 +196,7 @@ pub struct OkfServer {
     git_controls: HashMap<String, Arc<dyn GitControl>>,
     bundle_configs: HashMap<String, ResolvedBundleConfig>,
     session_branches: Arc<Mutex<HashMap<String, String>>>,
+    bundle_repos: HashMap<String, Arc<BundleRepo>>,
 }
 
 impl Clone for OkfServer {
@@ -199,6 +208,7 @@ impl Clone for OkfServer {
             git_controls: self.git_controls.clone(),
             bundle_configs: self.bundle_configs.clone(),
             session_branches: self.session_branches.clone(),
+            bundle_repos: self.bundle_repos.clone(),
         }
     }
 }
@@ -207,6 +217,7 @@ impl OkfServer {
     pub fn new(
         bundles: Vec<ResolvedBundleConfig>,
         audit_dir: Option<&str>,
+        search_index_dir: Option<&str>,
     ) -> Result<Self, String> {
         let mut bundle_repos: HashMap<String, Arc<BundleRepo>> = HashMap::new();
         let mut git_controls: HashMap<String, Arc<dyn GitControl>> = HashMap::new();
@@ -243,7 +254,12 @@ impl OkfServer {
                     }
                 };
 
-            let repo = Arc::new(BundleRepo::new(name.clone(), store, root));
+            let repo = Arc::new(BundleRepo::new(
+                name.clone(),
+                store,
+                root,
+                search_index_dir.map(std::path::Path::new),
+            ));
             bundle_repos.insert(name.clone(), repo);
             bundle_configs.insert(name.clone(), config.clone());
 
@@ -269,6 +285,8 @@ impl OkfServer {
             .map(|c| (c.name.clone(), c.write_allowlist.clone()))
             .collect();
 
+        let repos_for_watcher = bundle_repos.clone();
+
         Ok(Self {
             read_tools: Arc::new(crate::tools::read::ReadTools::new(
                 bundle_repos.clone(),
@@ -283,7 +301,13 @@ impl OkfServer {
             git_controls,
             bundle_configs,
             session_branches: Arc::new(Mutex::new(HashMap::new())),
+            bundle_repos: repos_for_watcher,
         })
+    }
+
+    pub fn start_file_watcher(&self) -> Result<(), String> {
+        let watcher = crate::watch::FileWatcher::new(self.bundle_repos.clone());
+        watcher.start()
     }
 
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error>> {
@@ -343,7 +367,7 @@ impl OkfServer {
             ),
             make_tool(
                 "okf_write_concept",
-                "Write a concept to a bundle",
+                "Write a concept to a bundle (supports body_sections with replace/merge mode)",
                 Self::tool_schema::<WriteConceptArgs>(),
             ),
             make_tool(
@@ -753,8 +777,18 @@ impl OkfServer {
             extra: serde_yaml::Mapping::new(),
         };
         let mode = a.mode.as_deref().unwrap_or("upsert");
+        let body = a.body.unwrap_or_default();
+        let body_sections = a.body_sections.map(|sections| {
+            sections
+                .into_iter()
+                .map(|s| BodySection {
+                    heading: s.heading,
+                    content: s.content,
+                })
+                .collect()
+        });
         self.write_tools
-            .write_concept(&a.bundle, &a.concept_id, fm, a.body, mode)
+            .write_concept(&a.bundle, &a.concept_id, fm, body, body_sections, a.body_section_mode, mode)
             .map_err(Self::err)
             .and_then(Self::text)
     }

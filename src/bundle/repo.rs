@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::bundle::search_index::SearchIndex;
 use crate::bundle::store::{BundleStore, StoreError, StoreResult};
 use crate::bundle::types::*;
 
@@ -9,15 +10,39 @@ pub struct BundleRepo {
     store: Arc<dyn BundleStore>,
     root: PathBuf,
     write_mutex: Mutex<()>,
+    search_index: Option<SearchIndex>,
 }
 
 impl BundleRepo {
-    pub fn new(name: String, store: Arc<dyn BundleStore>, root: PathBuf) -> Self {
+    pub fn new(
+        name: String,
+        store: Arc<dyn BundleStore>,
+        root: PathBuf,
+        search_index_dir: Option<&Path>,
+    ) -> Self {
+        let search_index = match search_index_dir {
+            Some(dir) => {
+                let index_dir = dir.join(&name);
+                match SearchIndex::new(&index_dir) {
+                    Ok(idx) => {
+                        tracing::info!("search index created at {:?}", index_dir);
+                        Some(idx)
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to create search index: {e}");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         Self {
             name,
             store,
             root,
             write_mutex: Mutex::new(()),
+            search_index,
         }
     }
 
@@ -27,6 +52,10 @@ impl BundleRepo {
 
     pub fn store(&self) -> &dyn BundleStore {
         self.store.as_ref()
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     // --- Listing ---
@@ -150,6 +179,12 @@ impl BundleRepo {
         let content = serialize_concept(&concept.frontmatter, &concept.body);
         self.store.write_raw(&path, &content)?;
 
+        // Update search index
+        if let Some(ref idx) = self.search_index {
+            let _ = idx.remove_concept(concept.id.as_str());
+            let _ = idx.add_concept(&concept);
+        }
+
         Ok(concept)
     }
 
@@ -160,6 +195,12 @@ impl BundleRepo {
             return Err(StoreError::NotFound(id.to_string()));
         }
         self.store.delete_raw(&path)?;
+
+        // Update search index
+        if let Some(ref idx) = self.search_index {
+            let _ = idx.remove_concept(id.as_str());
+        }
+
         Ok(true)
     }
 
@@ -529,12 +570,40 @@ impl BundleRepo {
 
     // --- Search ---
 
+    /// Re-index a concept by reading it from the store and updating the search index
+    /// without writing to the store. Used by file-watcher for external changes.
+    pub fn reindex_concept(&self, id: &ConceptId) {
+        if let Some(ref idx) = self.search_index {
+            if let Ok(concept) = self.read_concept(id) {
+                let _ = idx.remove_concept(id.as_str());
+                let _ = idx.add_concept(&concept);
+            }
+        }
+    }
+
+    /// Remove a concept from the search index without modifying the store.
+    pub fn remove_from_index(&self, id: &ConceptId) {
+        if let Some(ref idx) = self.search_index {
+            let _ = idx.remove_concept(id.as_str());
+        }
+    }
+
     pub fn search(
         &self,
         query: &str,
         type_filter: Option<&str>,
         tag_filter: Option<&str>,
     ) -> StoreResult<Vec<SearchResult>> {
+        // Use tantivy search index when available
+        if let Some(ref idx) = self.search_index {
+            match idx.search(query, type_filter, tag_filter, 50) {
+                Ok(results) => return Ok(results),
+                Err(e) => {
+                    tracing::warn!("search index query failed, falling back to linear scan: {e}");
+                }
+            }
+        }
+
         let all_concepts = self.list_concepts(None, type_filter, tag_filter)?;
         let query_lower = query.to_lowercase();
         let mut results = Vec::new();
@@ -628,7 +697,7 @@ pub struct IndexReadResult {
     pub sections: Option<Vec<IndexSection>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WriteMode {
     Create,
     Update,

@@ -9,7 +9,7 @@ fn setup_test_bundle(name: &str) -> (tempfile::TempDir, BundleRepo) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let store: Arc<dyn BundleStore> = Arc::new(LocalFsStore::new(root.clone()));
-    let repo = BundleRepo::new(name.to_string(), store, root);
+    let repo = BundleRepo::new(name.to_string(), store, root, None);
     (dir, repo)
 }
 
@@ -423,4 +423,190 @@ fn test_get_backlinks() {
     let backlinks = repo.get_backlinks(&ConceptId::new("target")).unwrap();
     assert_eq!(backlinks.len(), 1);
     assert_eq!(backlinks[0].to_string(), "source");
+}
+
+#[test]
+fn test_body_sections_render() {
+    let sections = vec![
+        BodySection {
+            heading: String::new(),
+            content: "Default intro content.".to_string(),
+        },
+        BodySection {
+            heading: "Schema".to_string(),
+            content: "| col | type |\n|-----|------|\n| id | INT64 |".to_string(),
+        },
+        BodySection {
+            heading: "Examples".to_string(),
+            content: "SELECT * FROM table".to_string(),
+        },
+    ];
+    let rendered = render_body_sections(&sections);
+    assert!(rendered.contains("Default intro content."));
+    assert!(rendered.contains("## Schema"));
+    assert!(rendered.contains("## Examples"));
+}
+
+#[test]
+fn test_body_sections_round_trip() {
+    let original = "This is the intro.\n\n## Schema\n\nid INT64\n\n## Examples\n\nSELECT 1";
+    let sections = parse_body_sections(original);
+    assert_eq!(sections.len(), 3);
+    assert_eq!(sections[0].heading, "");
+    assert!(sections[0].content.contains("intro"));
+    assert_eq!(sections[1].heading, "Schema");
+    assert!(sections[1].content.contains("id INT64"));
+    assert_eq!(sections[2].heading, "Examples");
+
+    let rendered = render_body_sections(&sections);
+    let reparsed = parse_body_sections(&rendered);
+    assert_eq!(reparsed.len(), sections.len());
+    for (a, b) in sections.iter().zip(reparsed.iter()) {
+        assert_eq!(a.heading, b.heading);
+        assert_eq!(a.content.trim(), b.content.trim());
+    }
+}
+
+#[test]
+fn test_body_sections_merge() {
+    let existing = vec![
+        BodySection {
+            heading: String::new(),
+            content: "Intro.".to_string(),
+        },
+        BodySection {
+            heading: "Schema".to_string(),
+            content: "old schema".to_string(),
+        },
+    ];
+    let incoming = vec![
+        BodySection {
+            heading: "Schema".to_string(),
+            content: "new schema".to_string(),
+        },
+        BodySection {
+            heading: "Examples".to_string(),
+            content: "example 1".to_string(),
+        },
+    ];
+    let merged = merge_body_sections(&existing, &incoming);
+    assert_eq!(merged.len(), 3);
+    // Incoming replaces existing by heading
+    assert_eq!(merged[0].heading, "");
+    assert_eq!(merged[0].content, "Intro.");
+    assert_eq!(merged[1].heading, "Schema");
+    assert_eq!(merged[1].content, "new schema");
+    assert_eq!(merged[2].heading, "Examples");
+    assert_eq!(merged[2].content, "example 1");
+}
+
+#[test]
+fn test_write_concept_with_body_sections() {
+    let (_dir, repo) = setup_test_bundle("test");
+
+    let sections = vec![
+        BodySection {
+            heading: String::new(),
+            content: "Intro paragraph.".to_string(),
+        },
+        BodySection {
+            heading: "Details".to_string(),
+            content: "Detailed content here.".to_string(),
+        },
+    ];
+    let body = render_body_sections(&sections);
+
+    let concept = Concept {
+        id: ConceptId::new("sectioned"),
+        frontmatter: Frontmatter {
+            r#type: "Type".to_string(),
+            title: Some("Sectioned".to_string()),
+            description: None,
+            resource: None,
+            tags: None,
+            timestamp: None,
+            extra: serde_yaml::Mapping::new(),
+        },
+        body,
+    };
+    repo.write_concept(concept, WriteMode::Create).unwrap();
+
+    let read = repo.read_concept(&ConceptId::new("sectioned")).unwrap();
+    let parsed = parse_body_sections(&read.body);
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].heading, "");
+    assert!(parsed[0].content.contains("Intro paragraph."));
+    assert_eq!(parsed[1].heading, "Details");
+    assert!(parsed[1].content.contains("Detailed content here."));
+}
+
+#[test]
+fn test_search_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("bundle");
+    std::fs::create_dir_all(&root).unwrap();
+    let index_dir = dir.path().join("search_index");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    let store: Arc<dyn BundleStore> = Arc::new(LocalFsStore::new(root.clone()));
+    let repo = BundleRepo::new("test".to_string(), store, root, Some(&index_dir));
+
+    let concept = Concept {
+        id: ConceptId::new("orders"),
+        frontmatter: Frontmatter {
+            r#type: "Table".to_string(),
+            title: Some("Orders".to_string()),
+            description: Some("Customer orders".to_string()),
+            resource: None,
+            tags: Some(vec!["billing".to_string()]),
+            timestamp: None,
+            extra: serde_yaml::Mapping::new(),
+        },
+        body: "This table contains order data.".to_string(),
+    };
+    repo.write_concept(concept, WriteMode::Create).unwrap();
+
+    let results = repo.search("orders", None, None).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].concept_id, "orders");
+
+    // Search by description text
+    let results = repo.search("customer", None, None).unwrap();
+    assert_eq!(results.len(), 1);
+
+    // Filter by type
+    let results = repo.search("orders", Some("Table"), None).unwrap();
+    assert_eq!(results.len(), 1);
+
+    let results = repo.search("orders", Some("View"), None).unwrap();
+    assert_eq!(results.len(), 0);
+
+    // Delete and search again
+    repo.delete_concept(&ConceptId::new("orders")).unwrap();
+    let results = repo.search("orders", None, None).unwrap();
+    assert_eq!(results.len(), 0);
+}
+
+#[test]
+fn test_search_index_fallback() {
+    // Without search index, linear search should still work
+    let (_dir, repo) = setup_test_bundle("test");
+
+    let concept = Concept {
+        id: ConceptId::new("products"),
+        frontmatter: Frontmatter {
+            r#type: "Table".to_string(),
+            title: Some("Products".to_string()),
+            description: Some("Product catalog".to_string()),
+            resource: None,
+            tags: Some(vec!["catalog".to_string()]),
+            timestamp: None,
+            extra: serde_yaml::Mapping::new(),
+        },
+        body: "All products are stored here.".to_string(),
+    };
+    repo.write_concept(concept, WriteMode::Create).unwrap();
+
+    let results = repo.search("products", None, None).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].concept_id, "products");
 }

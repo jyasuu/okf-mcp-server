@@ -80,6 +80,8 @@ impl WriteTools {
         concept_id: &str,
         frontmatter: Frontmatter,
         body: String,
+        body_sections: Option<Vec<BodySection>>,
+        body_section_mode: Option<String>,
         mode: &str,
     ) -> Result<Concept, String> {
         let repo = self.get_bundle(bundle)?;
@@ -112,11 +114,39 @@ impl WriteTools {
             }
         };
 
+        // Resolve body: body_sections takes precedence over raw body string
+        let resolved_body = if let Some(sections) = body_sections {
+            let section_mode = body_section_mode.as_deref().unwrap_or("replace");
+            match section_mode {
+                "merge" => {
+                    let existing_sections = if write_mode != WriteMode::Create {
+                        let id = ConceptId::new(concept_id);
+                        match repo.read_concept(&id) {
+                            Ok(existing) => parse_body_sections(&existing.body),
+                            Err(_) => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let merged = merge_body_sections(&existing_sections, &sections);
+                    render_body_sections(&merged)
+                }
+                "replace" => render_body_sections(&sections),
+                other => {
+                    return Err(format!(
+                        "invalid body_section_mode: {other}, expected replace/merge"
+                    ))
+                }
+            }
+        } else {
+            body
+        };
+
         let id = ConceptId::new(concept_id);
         let concept = Concept {
             id: id.clone(),
             frontmatter,
-            body,
+            body: resolved_body,
         };
 
         let result = repo.write_concept(concept, write_mode).map_err(|e| {
