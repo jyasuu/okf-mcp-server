@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::bundle::search_index::SearchIndex;
 use crate::bundle::store::{BundleStore, StoreError, StoreResult};
@@ -150,7 +150,10 @@ impl BundleRepo {
     // --- Writing ---
 
     pub fn write_concept(&self, concept: Concept, mode: WriteMode) -> StoreResult<Concept> {
-        let _guard = self.write_mutex.lock().unwrap();
+        let _guard = self
+            .write_mutex
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
 
         let path = concept.id.to_path();
         let exists = self.store.exists(&path);
@@ -189,7 +192,10 @@ impl BundleRepo {
     }
 
     pub fn delete_concept(&self, id: &ConceptId) -> StoreResult<bool> {
-        let _guard = self.write_mutex.lock().unwrap();
+        let _guard = self
+            .write_mutex
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
         let path = id.to_path();
         if !self.store.exists(&path) {
             return Err(StoreError::NotFound(id.to_string()));
@@ -346,7 +352,10 @@ impl BundleRepo {
     }
 
     pub fn write_index(&self, dir_path: &str, data: IndexData) -> StoreResult<String> {
-        let _guard = self.write_mutex.lock().unwrap();
+        let _guard = self
+            .write_mutex
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
 
         let is_root = dir_path.is_empty() || dir_path == "/";
         let index_path = if is_root {
@@ -375,7 +384,10 @@ impl BundleRepo {
         date: &str,
         entries: &[LogEntry],
     ) -> StoreResult<String> {
-        let _guard = self.write_mutex.lock().unwrap();
+        let _guard = self
+            .write_mutex
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
 
         let log_path = if dir_path.is_empty() || dir_path == "/" {
             "log.md".to_string()
@@ -398,7 +410,10 @@ impl BundleRepo {
     // --- Citations ---
 
     pub fn add_citation(&self, id: &ConceptId, citation: &CitationInput) -> StoreResult<String> {
-        let _guard = self.write_mutex.lock().unwrap();
+        let _guard = self
+            .write_mutex
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
 
         let path = id.to_path();
         let content = self.store.read_raw(&path)?;
@@ -635,6 +650,7 @@ impl BundleRepo {
                             &searchable,
                             &title,
                             &description,
+                            &tags,
                         );
                         let snippet = extract_snippet(&searchable, pos, 200);
 
@@ -801,9 +817,14 @@ fn serialize_concept(frontmatter: &Frontmatter, body: &str) -> String {
     format!("---\n{yaml_str}---\n\n{body}")
 }
 
+fn link_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\[([^\]]*)\]\(([^)]+)\)").unwrap())
+}
+
 fn extract_links(source: &ConceptId, body: &str) -> Vec<Link> {
     let mut links = Vec::new();
-    let re = regex::Regex::new(r"\[([^\]]*)\]\(([^)]+)\)").unwrap();
+    let re = link_regex();
 
     for cap in re.captures_iter(body) {
         let target_raw = cap[2].to_string();
@@ -832,6 +853,14 @@ fn resolve_link(target: &str) -> Option<ConceptId> {
     Some(ConceptId::new(clean))
 }
 
+fn index_entry_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"^\s*\*\s*\[([^\]]*)\]\(([^)]+)\)(?:\s*-\s*(.*))?")
+            .unwrap()
+    })
+}
+
 fn parse_index_body(body: &str) -> Option<Vec<IndexSection>> {
     let mut sections = Vec::new();
     let mut current_heading: Option<String> = None;
@@ -848,11 +877,7 @@ fn parse_index_body(body: &str) -> Option<Vec<IndexSection>> {
                 }
             }
             current_heading = Some(line[2..].trim().to_string());
-        } else if let Some(cap) =
-            regex::Regex::new(r"^\s*\*\s*\[([^\]]*)\]\(([^)]+)\)(?:\s*-\s*(.*))?")
-                .unwrap()
-                .captures(line)
-        {
+        } else if let Some(cap) = index_entry_regex().captures(line) {
             current_entries.push(IndexEntry {
                 title: cap[1].to_string(),
                 path: cap[2].to_string(),
@@ -963,11 +988,10 @@ fn append_to_log(existing: &str, date: &str, entries: &[LogEntry]) -> String {
             result.push_str(line);
             result.push('\n');
         } else if found_date {
-            // Skip old entries under the date heading if we just replaced them
-            if trimmed.is_empty() || trimmed.starts_with("## ") {
-                // Empty lines or new headings - keep them
-                // Actually, we already output the entries, so skip old ones
-                // Only keep non-bullet lines
+            // Under the matched date heading: skip old bullet entries, keep everything else
+            if !trimmed.starts_with("- ") {
+                result.push_str(line);
+                result.push('\n');
             }
         } else {
             result.push_str(line);
@@ -1042,7 +1066,13 @@ fn add_citation_to_body(body: &str, citation: &CitationInput) -> String {
     lines.join("\n") + "\n"
 }
 
-fn compute_relevance_score(query: &str, full_text: &str, title: &str, description: &str) -> f64 {
+fn compute_relevance_score(
+    query: &str,
+    full_text: &str,
+    title: &str,
+    description: &str,
+    tags: &str,
+) -> f64 {
     let mut score = 0.0;
     let title_lower = title.to_lowercase();
     let desc_lower = description.to_lowercase();
@@ -1061,10 +1091,10 @@ fn compute_relevance_score(query: &str, full_text: &str, title: &str, descriptio
         score += 5.0;
     }
 
-    // Body match count
-    let body_start = title.len() + description.len() + 2;
-    if body_start < full_text.len() {
-        let body = &full_text[body_start..].to_lowercase();
+    // Body match count — skip the metadata prefix: "{id} {title} {description} {tags} "
+    let prefix_len = 1 + title.len() + 1 + description.len() + 1 + tags.len() + 1;
+    if prefix_len < full_text.len() {
+        let body = &full_text[prefix_len..].to_lowercase();
         let count = body.matches(query).count();
         score += count as f64 * 1.0;
     }

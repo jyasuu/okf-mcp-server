@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use tantivy::collector::TopDocs;
@@ -8,9 +9,12 @@ use tantivy::{doc, Index, IndexWriter, TantivyDocument};
 
 use crate::bundle::types::{Concept, SearchResult};
 
+const COMMIT_BATCH_SIZE: usize = 50;
+
 pub struct SearchIndex {
     index: Index,
     writer: Mutex<IndexWriter>,
+    pending_ops: AtomicUsize,
     id_field: Field,
     title_field: Field,
     description_field: Field,
@@ -18,6 +22,14 @@ pub struct SearchIndex {
     tags_field: Field,
     body_field: Field,
     all_text_field: Field,
+}
+
+fn lock_writer(
+    writer: &Mutex<IndexWriter>,
+) -> Result<std::sync::MutexGuard<'_, IndexWriter>, String> {
+    writer
+        .lock()
+        .map_err(|e| format!("search index lock poisoned: {e}"))
 }
 
 impl SearchIndex {
@@ -45,6 +57,7 @@ impl SearchIndex {
         Ok(Self {
             index,
             writer: Mutex::new(writer),
+            pending_ops: AtomicUsize::new(0),
             id_field,
             title_field,
             description_field,
@@ -53,6 +66,17 @@ impl SearchIndex {
             body_field,
             all_text_field,
         })
+    }
+
+    fn maybe_commit(&self, writer: &mut IndexWriter) -> Result<(), String> {
+        let count = self.pending_ops.fetch_add(1, Ordering::Relaxed) + 1;
+        if count >= COMMIT_BATCH_SIZE {
+            self.pending_ops.store(0, Ordering::Relaxed);
+            writer
+                .commit()
+                .map_err(|e| format!("failed to commit index: {e}"))?;
+        }
+        Ok(())
     }
 
     pub fn add_concept(&self, concept: &Concept) -> Result<(), String> {
@@ -80,7 +104,7 @@ impl SearchIndex {
         let title_str = concept.frontmatter.title.as_deref().unwrap_or("");
         let desc_str = concept.frontmatter.description.as_deref().unwrap_or("");
 
-        let mut writer = self.writer.lock().unwrap();
+        let mut writer = lock_writer(&self.writer)?;
         writer
             .add_document(doc!(
                 self.id_field => concept.id.as_str(),
@@ -93,19 +117,21 @@ impl SearchIndex {
             ))
             .map_err(|e| format!("failed to index concept: {e}"))?;
 
-        writer
-            .commit()
-            .map_err(|e| format!("failed to commit index: {e}"))?;
+        self.maybe_commit(&mut writer)?;
 
         Ok(())
     }
 
     pub fn remove_concept(&self, id: &str) -> Result<(), String> {
-        let mut writer = self.writer.lock().unwrap();
-        writer.delete_term(tantivy::Term::from_field_text(
-            self.id_field,
-            id,
-        ));
+        let mut writer = lock_writer(&self.writer)?;
+        writer.delete_term(tantivy::Term::from_field_text(self.id_field, id));
+        self.maybe_commit(&mut writer)?;
+        Ok(())
+    }
+
+    pub fn flush(&self) -> Result<(), String> {
+        let mut writer = lock_writer(&self.writer)?;
+        self.pending_ops.store(0, Ordering::Relaxed);
         writer
             .commit()
             .map_err(|e| format!("failed to commit index: {e}"))?;
@@ -119,6 +145,10 @@ impl SearchIndex {
         tag_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SearchResult>, String> {
+        if self.pending_ops.load(Ordering::Relaxed) > 0 {
+            self.flush()?;
+        }
+
         let reader = self
             .index
             .reader_builder()

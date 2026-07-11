@@ -269,7 +269,7 @@ impl OkfServer {
 
             if first_audit.is_none() {
                 if let Some(dir) = audit_dir {
-                    match AuditLog::new(dir, &name) {
+                    match AuditLog::new(dir) {
                         Ok(log) => first_audit = Some(Arc::new(log)),
                         Err(e) => eprintln!("warning: failed to create audit log: {e}"),
                     }
@@ -285,23 +285,30 @@ impl OkfServer {
             .map(|c| (c.name.clone(), c.write_allowlist.clone()))
             .collect();
 
-        let repos_for_watcher = bundle_repos.clone();
+        let backends: HashMap<String, crate::config::BundleBackend> = bundles
+            .iter()
+            .map(|c| (c.name.clone(), c.backend.clone()))
+            .collect();
+
+        let read_tools = Arc::new(crate::tools::read::ReadTools::new(
+            bundle_repos.clone(),
+            backends,
+            audit.clone(),
+        ));
+        let write_tools = Arc::new(crate::tools::write::WriteTools::new(
+            bundle_repos.clone(),
+            audit,
+            allowlists,
+        ));
 
         Ok(Self {
-            read_tools: Arc::new(crate::tools::read::ReadTools::new(
-                bundle_repos.clone(),
-                audit.clone(),
-            )),
-            write_tools: Arc::new(crate::tools::write::WriteTools::new(
-                bundle_repos,
-                audit,
-                allowlists,
-            )),
+            read_tools,
+            write_tools,
             tools,
             git_controls,
             bundle_configs,
             session_branches: Arc::new(Mutex::new(HashMap::new())),
-            bundle_repos: repos_for_watcher,
+            bundle_repos,
         })
     }
 
@@ -469,7 +476,9 @@ impl OkfServer {
             return Ok(());
         }
 
-        let mut sessions = self.session_branches.lock().unwrap();
+        let mut sessions = self.session_branches.lock().map_err(|e| {
+            Self::err(format!("session lock poisoned: {e}"))
+        })?;
         if sessions.contains_key(bundle) {
             return Ok(());
         }

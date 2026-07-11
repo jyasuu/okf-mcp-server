@@ -25,9 +25,9 @@ pub struct AuditLog {
 }
 
 impl AuditLog {
-    pub fn new(data_dir: &str, bundle_name: &str) -> Result<Self, std::io::Error> {
+    pub fn new(data_dir: &str) -> Result<Self, std::io::Error> {
         fs::create_dir_all(data_dir)?;
-        let file = PathBuf::from(data_dir).join(format!("{bundle_name}.jsonl"));
+        let file = PathBuf::from(data_dir).join("audit.jsonl");
         Ok(Self {
             file,
             mutex: Mutex::new(()),

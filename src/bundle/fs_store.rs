@@ -21,17 +21,48 @@ impl LocalFsStore {
     fn resolve(&self, path: &str) -> StoreResult<PathBuf> {
         let safe = PathChecker::check(path)?;
         let resolved = self.root.join(&safe);
-        let canonical = resolved.canonicalize().unwrap_or(resolved);
-        if !canonical.starts_with(&self.root) {
-            return Err(StoreError::PathSafety(
-                crate::bundle::path_safety::PathSafetyError::ResolvesOutsideRoot {
-                    input: path.to_string(),
-                    resolved: canonical.to_string_lossy().to_string(),
-                    root: self.root.to_string_lossy().to_string(),
-                },
-            ));
+        if let Ok(canonical) = resolved.canonicalize() {
+            if !canonical.starts_with(&self.root) {
+                return Err(StoreError::PathSafety(
+                    crate::bundle::path_safety::PathSafetyError::ResolvesOutsideRoot {
+                        input: path.to_string(),
+                        resolved: canonical.to_string_lossy().to_string(),
+                        root: self.root.to_string_lossy().to_string(),
+                    },
+                ));
+            }
+            Ok(canonical)
+        } else {
+            // File doesn't exist yet — verify each existing parent is safe
+            self.verify_parent_chain(&safe)?;
+            Ok(resolved)
         }
-        Ok(canonical)
+    }
+
+    fn verify_parent_chain(&self, relative: &str) -> StoreResult<()> {
+        let parts: Vec<&str> = relative.split('/').collect();
+        let mut current = self.root.clone();
+        for part in &parts[..parts.len().saturating_sub(1)] {
+            current = current.join(part);
+            if current.is_symlink() {
+                let target = std::fs::read_link(&current).map_err(StoreError::Io)?;
+                let canonical = if target.is_absolute() {
+                    target
+                } else {
+                    current.parent().unwrap_or(&self.root).join(target)
+                };
+                if !canonical.starts_with(&self.root) {
+                    return Err(StoreError::PathSafety(
+                        crate::bundle::path_safety::PathSafetyError::SymlinkOutsideRoot {
+                            input: relative.to_string(),
+                            target: canonical.to_string_lossy().to_string(),
+                            root: self.root.to_string_lossy().to_string(),
+                        },
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn relative_path(&self, abs: &Path) -> String {
@@ -73,7 +104,10 @@ impl BundleStore for LocalFsStore {
     }
 
     fn write_raw(&self, path: &str, content: &str) -> StoreResult<()> {
-        let _guard = self.write_mutex.lock().unwrap();
+        let _guard = self
+            .write_mutex
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
         let resolved = self.resolve(path)?;
 
         // Ensure parent directory exists
@@ -89,7 +123,10 @@ impl BundleStore for LocalFsStore {
     }
 
     fn delete_raw(&self, path: &str) -> StoreResult<()> {
-        let _guard = self.write_mutex.lock().unwrap();
+        let _guard = self
+            .write_mutex
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
         let resolved = self.resolve(path)?;
         if !resolved.exists() {
             return Err(StoreError::NotFound(path.to_string()));

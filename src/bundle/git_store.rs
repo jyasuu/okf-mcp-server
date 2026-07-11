@@ -39,17 +39,47 @@ impl GitStore {
     fn resolve(&self, path: &str) -> StoreResult<PathBuf> {
         let safe = PathChecker::check(path)?;
         let resolved = self.root.join(&safe);
-        let canonical = resolved.canonicalize().unwrap_or(resolved);
-        if !canonical.starts_with(&self.root) {
-            return Err(StoreError::PathSafety(
-                crate::bundle::path_safety::PathSafetyError::ResolvesOutsideRoot {
-                    input: path.to_string(),
-                    resolved: canonical.to_string_lossy().to_string(),
-                    root: self.root.to_string_lossy().to_string(),
-                },
-            ));
+        if let Ok(canonical) = resolved.canonicalize() {
+            if !canonical.starts_with(&self.root) {
+                return Err(StoreError::PathSafety(
+                    crate::bundle::path_safety::PathSafetyError::ResolvesOutsideRoot {
+                        input: path.to_string(),
+                        resolved: canonical.to_string_lossy().to_string(),
+                        root: self.root.to_string_lossy().to_string(),
+                    },
+                ));
+            }
+            Ok(canonical)
+        } else {
+            self.verify_parent_chain(&safe)?;
+            Ok(resolved)
         }
-        Ok(canonical)
+    }
+
+    fn verify_parent_chain(&self, relative: &str) -> StoreResult<()> {
+        let parts: Vec<&str> = relative.split('/').collect();
+        let mut current = self.root.clone();
+        for part in &parts[..parts.len().saturating_sub(1)] {
+            current = current.join(part);
+            if current.is_symlink() {
+                let target = std::fs::read_link(&current).map_err(StoreError::Io)?;
+                let canonical = if target.is_absolute() {
+                    target
+                } else {
+                    current.parent().unwrap_or(&self.root).join(target)
+                };
+                if !canonical.starts_with(&self.root) {
+                    return Err(StoreError::PathSafety(
+                        crate::bundle::path_safety::PathSafetyError::SymlinkOutsideRoot {
+                            input: relative.to_string(),
+                            target: canonical.to_string_lossy().to_string(),
+                            root: self.root.to_string_lossy().to_string(),
+                        },
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn relative_path(&self, abs: &Path) -> String {
@@ -60,7 +90,10 @@ impl GitStore {
 
     fn stage_path(&self, path: &str) -> StoreResult<()> {
         let rel = path.trim_start_matches('/');
-        let repo = self.repo.lock().unwrap();
+        let repo = self
+            .repo
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
         let mut index = repo
             .index()
             .map_err(|e| StoreError::Other(format!("failed to open index: {e}")))?;
@@ -109,8 +142,14 @@ impl BundleStore for GitStore {
         }
 
         let mut files = Vec::new();
+        // Lock is held during tree walk because walk_tree needs &Repository for
+        // entry.to_object(). This is read-only and safe, but blocks concurrent writes.
+        // For large repos, consider caching the file list.
         {
-            let repo = self.repo.lock().unwrap();
+            let repo = self
+                .repo
+                .lock()
+                .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
             let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
 
             if let Some(tree) = tree {
@@ -142,7 +181,10 @@ impl BundleStore for GitStore {
     }
 
     fn write_raw(&self, path: &str, content: &str) -> StoreResult<()> {
-        let _guard = self.write_mutex.lock().unwrap();
+        let _guard = self
+            .write_mutex
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
         let resolved = self.resolve(path)?;
 
         if let Some(parent) = resolved.parent() {
@@ -159,7 +201,10 @@ impl BundleStore for GitStore {
     }
 
     fn delete_raw(&self, path: &str) -> StoreResult<()> {
-        let _guard = self.write_mutex.lock().unwrap();
+        let _guard = self
+            .write_mutex
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
         let resolved = self.resolve(path)?;
         if !resolved.exists() {
             return Err(StoreError::NotFound(path.to_string()));
@@ -167,7 +212,10 @@ impl BundleStore for GitStore {
         std::fs::remove_file(&resolved).map_err(StoreError::Io)?;
 
         let rel = path.trim_start_matches('/');
-        let repo = self.repo.lock().unwrap();
+        let repo = self
+            .repo
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
         let mut index = repo
             .index()
             .map_err(|e| StoreError::Other(format!("failed to open index: {e}")))?;
@@ -191,7 +239,10 @@ impl BundleStore for GitStore {
 
 impl GitControl for GitStore {
     fn status(&self) -> StoreResult<GitStatus> {
-        let repo = self.repo.lock().unwrap();
+        let repo = self
+            .repo
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
         let branch = repo
             .head()
             .ok()
@@ -202,7 +253,7 @@ impl GitControl for GitStore {
         let mut unstaged = Vec::new();
         let mut untracked = Vec::new();
 
-        let mut index = repo
+        let index = repo
             .index()
             .map_err(|e| StoreError::Other(format!("failed to open index: {e}")))?;
         let diff_staged = repo
@@ -263,8 +314,11 @@ impl GitControl for GitStore {
     }
 
     fn diff(&self, path: Option<&str>) -> StoreResult<String> {
-        let repo = self.repo.lock().unwrap();
-        let mut index = repo
+        let repo = self
+            .repo
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
+        let index = repo
             .index()
             .map_err(|e| StoreError::Other(format!("failed to open index: {e}")))?;
         let diff = if let Some(single_path) = path {
@@ -295,7 +349,10 @@ impl GitControl for GitStore {
     }
 
     fn commit(&self, message: &str, author: Option<&str>) -> StoreResult<String> {
-        let repo = self.repo.lock().unwrap();
+        let repo = self
+            .repo
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
         let sig = if let Some(name) = author {
             Signature::now(name, "agent@okf-mcp-server")
         } else {
@@ -327,7 +384,10 @@ impl GitControl for GitStore {
     }
 
     fn push(&self, remote: Option<&str>, branch: Option<&str>) -> StoreResult<PushResult> {
-        let repo = self.repo.lock().unwrap();
+        let repo = self
+            .repo
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
         let remote_name = remote.unwrap_or("origin");
         let mut remote_obj = repo
             .find_remote(remote_name)
@@ -365,7 +425,10 @@ impl GitControl for GitStore {
 
     fn pull(&self, remote: Option<&str>, branch: Option<&str>) -> StoreResult<PullResult> {
         let remote_name = remote.unwrap_or("origin");
-        let repo = self.repo.lock().unwrap();
+        let repo = self
+            .repo
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
 
         let branch_name = branch
             .map(|s| s.to_string())
@@ -404,8 +467,8 @@ impl GitControl for GitStore {
                 .peel_to_commit()
                 .map_err(|e| StoreError::Other(format!("failed to peel local ref: {e}")))?;
 
+            // Check if already up-to-date
             let merge_base = repo.merge_base(local_commit.id(), fetch_commit.id());
-
             if let Ok(base_oid) = merge_base {
                 if base_oid == fetch_commit.id() {
                     return Ok(PullResult {
@@ -413,180 +476,98 @@ impl GitControl for GitStore {
                         conflicts: None,
                     });
                 }
-                if base_oid == local_commit.id() {
-                    // Fast-forward
-                    let annotated = repo.find_annotated_commit(fetch_commit.id()).map_err(|e| {
-                        StoreError::Other(format!("failed to annotate commit: {e}"))
-                    })?;
-                    let analysis = repo
-                        .merge_analysis(&[&annotated])
-                        .map_err(|e| StoreError::Other(format!("merge analysis failed: {e}")))?;
-
-                    if analysis.0.is_up_to_date() {
-                        return Ok(PullResult {
-                            updated: false,
-                            conflicts: None,
-                        });
-                    }
-
-                    if analysis.0.is_fast_forward() {
-                        let fetch_tree = fetch_commit.tree().map_err(|e| {
-                            StoreError::Other(format!("failed to get fetch tree: {e}"))
-                        })?;
-
-                        let mut checkout = git2::build::CheckoutBuilder::new();
-                        checkout.force();
-                        repo.checkout_tree(fetch_tree.as_object(), Some(&mut checkout))
-                            .map_err(|e| StoreError::Other(format!("checkout failed: {e}")))?;
-
-                        local_ref
-                            .set_target(fetch_commit.id(), "pull: fast-forward")
-                            .map_err(|e| StoreError::Other(format!("failed to update ref: {e}")))?;
-                        return Ok(PullResult {
-                            updated: true,
-                            conflicts: None,
-                        });
-                    }
-                }
             }
 
-            // Not a fast-forward, check for conflicts
+            // Try fast-forward merge
+            if let Some(result) =
+                try_fast_forward(&repo, &mut local_ref, &fetch_commit, &branch_ref_name)?
+            {
+                return Ok(result);
+            }
+
+            // Normal (non-fast-forward) merge
+            repo.set_head(&branch_ref_name)
+                .map_err(|e| StoreError::Other(format!("failed to set head: {e}")))?;
+
             let annotated = repo
                 .find_annotated_commit(fetch_commit.id())
                 .map_err(|e| StoreError::Other(format!("failed to annotate commit: {e}")))?;
-            let analysis = repo
-                .merge_analysis(&[&annotated])
-                .map_err(|e| StoreError::Other(format!("merge analysis failed: {e}")))?;
+            let merge_result = repo.merge(&[&annotated], None, None);
 
-            if analysis.0.is_up_to_date() {
-                return Ok(PullResult {
-                    updated: false,
-                    conflicts: None,
-                });
-            }
+            match merge_result {
+                Ok(()) => {
+                    let mut index = repo
+                        .index()
+                        .map_err(|e| StoreError::Other(format!("failed to get index: {e}")))?;
 
-            if analysis.0.is_fast_forward() {
-                let fetch_tree = fetch_commit
-                    .tree()
-                    .map_err(|e| StoreError::Other(format!("failed to get fetch tree: {e}")))?;
-
-                let mut checkout = git2::build::CheckoutBuilder::new();
-                checkout.force();
-                repo.checkout_tree(fetch_tree.as_object(), Some(&mut checkout))
-                    .map_err(|e| StoreError::Other(format!("checkout failed: {e}")))?;
-
-                local_ref
-                    .set_target(fetch_commit.id(), "pull: fast-forward")
-                    .map_err(|e| StoreError::Other(format!("failed to update ref: {e}")))?;
-                return Ok(PullResult {
-                    updated: true,
-                    conflicts: None,
-                });
-            }
-
-            if analysis.0.is_normal() {
-                repo.set_head(&branch_ref_name)
-                    .map_err(|e| StoreError::Other(format!("failed to set head: {e}")))?;
-
-                let annotated = repo
-                    .find_annotated_commit(fetch_commit.id())
-                    .map_err(|e| StoreError::Other(format!("failed to annotate commit: {e}")))?;
-                let merge_result = repo.merge(&[&annotated], None, None);
-
-                match merge_result {
-                    Ok(()) => {
-                        let mut index = repo
-                            .index()
-                            .map_err(|e| StoreError::Other(format!("failed to get index: {e}")))?;
-
-                        if index.has_conflicts() {
-                            let mut conflicts = Vec::new();
-                            let paths: Vec<Vec<u8>> = index
-                                .conflicts()
-                                .map_err(|e| {
-                                    StoreError::Other(format!("failed to get conflicts: {e}"))
-                                })?
-                                .filter_map(|r| r.ok())
-                                .flat_map(|c| {
-                                    c.ancestor
-                                        .or_else(|| c.our)
-                                        .or_else(|| c.their)
-                                        .map(|e| e.path)
-                                })
-                                .collect();
-                            for path in paths {
-                                conflicts.push(String::from_utf8_lossy(&path).to_string());
-                            }
-                            repo.cleanup_state().ok();
-                            return Ok(PullResult {
-                                updated: false,
-                                conflicts: Some(conflicts),
-                            });
-                        }
-
-                        let sig = Signature::now("okf-mcp-server", "agent@okf-mcp-server")
-                            .map_err(|e| {
-                                StoreError::Other(format!("failed to create signature: {e}"))
-                            })?;
-
-                        let tree_oid = index
-                            .write_tree()
-                            .map_err(|e| StoreError::Other(format!("failed to write tree: {e}")))?;
-                        let tree = repo
-                            .find_tree(tree_oid)
-                            .map_err(|e| StoreError::Other(format!("failed to find tree: {e}")))?;
-
-                        let local_commit_obj =
-                            repo.find_commit(local_commit.id()).map_err(|e| {
-                                StoreError::Other(format!("failed to find local commit: {e}"))
-                            })?;
-
-                        repo.commit(
-                            Some("HEAD"),
-                            &sig,
-                            &sig,
-                            &format!("Merge remote-tracking branch '{remote_name}/{branch_name}'"),
-                            &tree,
-                            &[&local_commit_obj, &fetch_commit],
-                        )
-                        .map_err(|e| StoreError::Other(format!("merge commit failed: {e}")))?;
-
+                    if index.has_conflicts() {
+                        let conflicts = collect_conflict_paths(&mut index);
                         repo.cleanup_state().ok();
                         return Ok(PullResult {
-                            updated: true,
-                            conflicts: None,
+                            updated: false,
+                            conflicts: Some(conflicts),
                         });
                     }
-                    Err(e) => {
-                        repo.cleanup_state().ok();
-                        if e.message().contains("conflict") {
-                            let conflicts: Vec<String> = repo
-                                .index()
-                                .ok()
-                                .and_then(|mut idx| {
-                                    let iter = idx.conflicts().ok()?;
-                                    let mut paths = Vec::new();
-                                    for r in iter {
-                                        if let Ok(c) = r {
-                                            if let Some(e) =
-                                                c.ancestor.or_else(|| c.our).or_else(|| c.their)
-                                            {
-                                                paths.push(
-                                                    String::from_utf8_lossy(&e.path).to_string(),
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Some(paths)
-                                })
-                                .unwrap_or_default();
-                            return Ok(PullResult {
-                                updated: false,
-                                conflicts: Some(conflicts),
-                            });
-                        }
-                        return Err(StoreError::Other(format!("merge failed: {e}")));
+
+                    let sig = Signature::now("okf-mcp-server", "agent@okf-mcp-server")
+                        .map_err(|e| {
+                            StoreError::Other(format!("failed to create signature: {e}"))
+                        })?;
+
+                    let tree_oid = index
+                        .write_tree()
+                        .map_err(|e| StoreError::Other(format!("failed to write tree: {e}")))?;
+                    let tree = repo
+                        .find_tree(tree_oid)
+                        .map_err(|e| StoreError::Other(format!("failed to find tree: {e}")))?;
+
+                    let local_commit_obj =
+                        repo.find_commit(local_commit.id()).map_err(|e| {
+                            StoreError::Other(format!("failed to find local commit: {e}"))
+                        })?;
+
+                    repo.commit(
+                        Some("HEAD"),
+                        &sig,
+                        &sig,
+                        &format!("Merge remote-tracking branch '{remote_name}/{branch_name}'"),
+                        &tree,
+                        &[&local_commit_obj, &fetch_commit],
+                    )
+                    .map_err(|e| StoreError::Other(format!("merge commit failed: {e}")))?;
+
+                    repo.cleanup_state().ok();
+                    return Ok(PullResult {
+                        updated: true,
+                        conflicts: None,
+                    });
+                }
+                Err(e) => {
+                    repo.cleanup_state().ok();
+                    if e.message().contains("conflict") {
+                        let mut index = repo.index().ok();
+                        let conflicts = index
+                            .as_mut()
+                            .and_then(|idx| idx.conflicts().ok())
+                            .map(|iter| {
+                                iter.filter_map(|r| r.ok())
+                                    .filter_map(|c| {
+                                        c.ancestor
+                                            .or_else(|| c.our)
+                                            .or_else(|| c.their)
+                                            .map(|e| {
+                                                String::from_utf8_lossy(&e.path).to_string()
+                                            })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        return Ok(PullResult {
+                            updated: false,
+                            conflicts: Some(conflicts),
+                        });
                     }
+                    return Err(StoreError::Other(format!("merge failed: {e}")));
                 }
             }
         } else {
@@ -612,7 +593,10 @@ impl GitControl for GitStore {
     }
 
     fn create_branch(&self, name: &str, from: Option<&str>) -> StoreResult<String> {
-        let repo = self.repo.lock().unwrap();
+        let repo = self
+            .repo
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
         let commit = if let Some(source) = from {
             let source_ref = if source.starts_with("refs/") {
                 source.to_string()
@@ -650,7 +634,10 @@ impl GitControl for GitStore {
     }
 
     fn current_branch(&self) -> StoreResult<String> {
-        let repo = self.repo.lock().unwrap();
+        let repo = self
+            .repo
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
         repo.head()
             .ok()
             .and_then(|h| h.shorthand().map(String::from))
@@ -659,7 +646,10 @@ impl GitControl for GitStore {
 
     fn add(&self, path: &str) -> StoreResult<()> {
         let rel = path.trim_start_matches('/');
-        let repo = self.repo.lock().unwrap();
+        let repo = self
+            .repo
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
         let mut index = repo
             .index()
             .map_err(|e| StoreError::Other(format!("failed to open index: {e}")))?;
@@ -673,7 +663,10 @@ impl GitControl for GitStore {
     }
 
     fn stage_all(&self) -> StoreResult<()> {
-        let repo = self.repo.lock().unwrap();
+        let repo = self
+            .repo
+            .lock()
+            .map_err(|e| StoreError::Other(format!("lock poisoned: {e}")))?;
         let mut index = repo
             .index()
             .map_err(|e| StoreError::Other(format!("failed to open index: {e}")))?;
@@ -685,6 +678,65 @@ impl GitControl for GitStore {
             .map_err(|e| StoreError::Other(format!("failed to write index: {e}")))?;
         Ok(())
     }
+}
+
+fn try_fast_forward<'a>(
+    repo: &'a Repository,
+    local_ref: &mut git2::Reference<'a>,
+    fetch_commit: &git2::Commit<'_>,
+    _branch_ref_name: &str,
+) -> StoreResult<Option<PullResult>> {
+    let annotated = repo
+        .find_annotated_commit(fetch_commit.id())
+        .map_err(|e| StoreError::Other(format!("failed to annotate commit: {e}")))?;
+    let analysis = repo
+        .merge_analysis(&[&annotated])
+        .map_err(|e| StoreError::Other(format!("merge analysis failed: {e}")))?;
+
+    if analysis.0.is_up_to_date() {
+        return Ok(Some(PullResult {
+            updated: false,
+            conflicts: None,
+        }));
+    }
+
+    if analysis.0.is_fast_forward() {
+        let fetch_tree = fetch_commit
+            .tree()
+            .map_err(|e| StoreError::Other(format!("failed to get fetch tree: {e}")))?;
+
+        let mut checkout = git2::build::CheckoutBuilder::new();
+        checkout.force();
+        repo.checkout_tree(fetch_tree.as_object(), Some(&mut checkout))
+            .map_err(|e| StoreError::Other(format!("checkout failed: {e}")))?;
+
+        local_ref
+            .set_target(fetch_commit.id(), "pull: fast-forward")
+            .map_err(|e| StoreError::Other(format!("failed to update ref: {e}")))?;
+
+        return Ok(Some(PullResult {
+            updated: true,
+            conflicts: None,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn collect_conflict_paths(index: &mut git2::Index) -> Vec<String> {
+    index
+        .conflicts()
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.ok())
+        .filter_map(|c| {
+            c.ancestor
+                .or_else(|| c.our)
+                .or_else(|| c.their)
+                .map(|e| String::from_utf8_lossy(&e.path).to_string())
+        })
+        .collect()
 }
 
 fn walk_tree(

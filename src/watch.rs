@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,11 +11,15 @@ use crate::bundle::types::ConceptId;
 
 pub struct FileWatcher {
     repos: HashMap<String, Arc<BundleRepo>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl FileWatcher {
     pub fn new(repos: HashMap<String, Arc<BundleRepo>>) -> Self {
-        Self { repos }
+        Self {
+            repos,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn start(&self) -> Result<(), String> {
@@ -36,45 +41,56 @@ impl FileWatcher {
             }
         }
 
-        // Spawn a thread to process events
         let repos = self.repos.clone();
-        std::thread::spawn(move || {
-            let mut pending: HashMap<PathBuf, EventKind> = HashMap::new();
-            let mut last_event: Option<std::time::Instant> = None;
+        let shutdown = self.shutdown.clone();
+        std::thread::Builder::new()
+            .name("file-watcher".to_string())
+            .spawn(move || {
+                let mut pending: HashMap<PathBuf, EventKind> = HashMap::new();
+                let mut last_event: Option<std::time::Instant> = None;
 
-            loop {
-                // Process available events with debouncing
-                while let Ok(result) = rx.try_recv() {
-                    match result {
-                        Ok(event) => {
-                            for path in &event.paths {
-                                if should_ignore(path) {
-                                    continue;
+                loop {
+                    if shutdown.load(Ordering::Relaxed) {
+                        tracing::info!("file watcher shutting down");
+                        break;
+                    }
+
+                    while let Ok(result) = rx.try_recv() {
+                        match result {
+                            Ok(event) => {
+                                for path in &event.paths {
+                                    if should_ignore(path) {
+                                        continue;
+                                    }
+                                    pending.insert(path.clone(), event.kind.clone());
+                                    last_event = Some(std::time::Instant::now());
                                 }
-                                pending.insert(path.clone(), event.kind.clone());
-                                last_event = Some(std::time::Instant::now());
+                            }
+                            Err(e) => {
+                                tracing::error!("file watcher error: {e}");
                             }
                         }
-                        Err(e) => {
-                            tracing::error!("file watcher error: {e}");
+                    }
+
+                    if let Some(last) = last_event {
+                        if last.elapsed() >= Duration::from_millis(300) {
+                            process_events(&repos, &pending);
+                            pending.clear();
+                            last_event = None;
                         }
                     }
-                }
 
-                // Process pending events after debounce period
-                if let Some(last) = last_event {
-                    if last.elapsed() >= Duration::from_millis(300) {
-                        process_events(&repos, &pending);
-                        pending.clear();
-                        last_event = None;
-                    }
+                    std::thread::sleep(Duration::from_millis(100));
                 }
-
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        });
+                drop(watcher);
+            })
+            .map_err(|e| format!("failed to spawn watcher thread: {e}"))?;
 
         Ok(())
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
     }
 }
 
