@@ -64,12 +64,6 @@ impl LocalFsStore {
         }
         Ok(())
     }
-
-    fn relative_path(&self, abs: &Path) -> String {
-        let rel = pathdiff::diff_paths(abs, &self.root);
-        let rel = rel.unwrap_or_else(|| abs.to_path_buf());
-        rel.to_string_lossy().replace('\\', "/")
-    }
 }
 
 impl BundleStore for LocalFsStore {

@@ -5,7 +5,7 @@ use rmcp::{
     model::*, schemars, service::RequestContext, transport, ErrorData, RoleServer, ServerHandler,
     ServiceExt,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::audit::AuditLog;
 use crate::bundle::fs_store::LocalFsStore;
@@ -28,8 +28,7 @@ pub struct BundleArg {
 pub struct ListConceptsArgs {
     pub bundle: String,
     pub prefix: Option<String>,
-    #[serde(rename = "type")]
-    pub r#type: Option<String>,
+    pub concept_type: Option<String>,
     pub tag: Option<String>,
 }
 
@@ -49,8 +48,7 @@ pub struct ReadIndexArgs {
 pub struct SearchArgs {
     pub bundle: String,
     pub query: String,
-    #[serde(rename = "type")]
-    pub r#type: Option<String>,
+    pub concept_type: Option<String>,
     pub tag: Option<String>,
 }
 
@@ -70,28 +68,7 @@ pub struct GraphArgs {
 pub struct WriteConceptArgs {
     pub bundle: String,
     pub concept_id: String,
-    pub frontmatter: FrontmatterInput,
-    pub body: Option<String>,
-    pub mode: Option<String>,
-    pub body_sections: Option<Vec<BodySectionInput>>,
-    pub body_section_mode: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct BodySectionInput {
-    pub heading: String,
-    pub content: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct FrontmatterInput {
-    #[serde(rename = "type")]
-    pub r#type: String,
-    pub title: Option<String>,
-    pub description: Option<String>,
-    pub resource: Option<String>,
-    pub tags: Option<Vec<String>>,
-    pub timestamp: Option<String>,
+    pub data: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -293,7 +270,6 @@ impl OkfServer {
         let read_tools = Arc::new(crate::tools::read::ReadTools::new(
             bundle_repos.clone(),
             backends,
-            audit.clone(),
         ));
         let write_tools = Arc::new(crate::tools::write::WriteTools::new(
             bundle_repos.clone(),
@@ -691,7 +667,7 @@ impl OkfServer {
             .list_concepts(
                 &a.bundle,
                 a.prefix.as_deref(),
-                a.r#type.as_deref(),
+                a.concept_type.as_deref(),
                 a.tag.as_deref(),
             )
             .map_err(Self::err)
@@ -726,7 +702,7 @@ impl OkfServer {
     ) -> Result<CallToolResult, ErrorData> {
         let a: SearchArgs = Self::parse_args(args)?;
         self.read_tools
-            .search(&a.bundle, &a.query, a.r#type.as_deref(), a.tag.as_deref())
+            .search(&a.bundle, &a.query, a.concept_type.as_deref(), a.tag.as_deref())
             .map_err(Self::err)
             .and_then(Self::text)
     }
@@ -776,28 +752,51 @@ impl OkfServer {
     ) -> Result<CallToolResult, ErrorData> {
         let a: WriteConceptArgs = Self::parse_args(args)?;
         self.ensure_session_branch(&a.bundle)?;
+
+        let data: serde_json::Value = serde_json::from_str(&a.data)
+            .map_err(|e| ErrorData::invalid_params(format!("invalid data JSON: {e}"), None::<serde_json::Value>))?;
+
+        let r#type = data.get("type").and_then(|v| v.as_str()).unwrap_or("Concept").to_string();
+        let title = data.get("title").and_then(|v| v.as_str()).map(String::from);
+        let description = data.get("description").and_then(|v| v.as_str()).map(String::from);
+        let resource = data.get("resource").and_then(|v| v.as_str()).map(String::from);
+        let timestamp = data.get("timestamp").and_then(|v| v.as_str()).map(String::from);
+        let tags = data.get("tags").and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .or_else(|| v.as_str().map(|s| {
+                s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()
+            }))
+        });
+        let mode = data.get("mode").and_then(|v| v.as_str()).unwrap_or("upsert").to_string();
+        let body = data.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let body_section_mode = data.get("body_section_mode").and_then(|v| v.as_str()).map(String::from);
+        let body_sections = data.get("body_sections").and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|s| {
+                        let heading = s.get("heading")?.as_str()?.to_string();
+                        let content = s.get("content")?.as_str()?.to_string();
+                        Some(BodySection { heading, content })
+                    })
+                    .collect::<Vec<_>>()
+            })
+        });
+
         let fm = Frontmatter {
-            r#type: a.frontmatter.r#type,
-            title: a.frontmatter.title,
-            description: a.frontmatter.description,
-            resource: a.frontmatter.resource,
-            tags: a.frontmatter.tags,
-            timestamp: a.frontmatter.timestamp,
+            r#type,
+            title,
+            description,
+            resource,
+            tags,
+            timestamp,
             extra: serde_yaml::Mapping::new(),
         };
-        let mode = a.mode.as_deref().unwrap_or("upsert");
-        let body = a.body.unwrap_or_default();
-        let body_sections = a.body_sections.map(|sections| {
-            sections
-                .into_iter()
-                .map(|s| BodySection {
-                    heading: s.heading,
-                    content: s.content,
-                })
-                .collect()
-        });
         self.write_tools
-            .write_concept(&a.bundle, &a.concept_id, fm, body, body_sections, a.body_section_mode, mode)
+            .write_concept(&a.bundle, &a.concept_id, fm, body, body_sections, body_section_mode, &mode)
             .map_err(Self::err)
             .and_then(Self::text)
     }

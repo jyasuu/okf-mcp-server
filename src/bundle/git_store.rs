@@ -82,12 +82,6 @@ impl GitStore {
         Ok(())
     }
 
-    fn relative_path(&self, abs: &Path) -> String {
-        let rel = pathdiff::diff_paths(abs, &self.root);
-        let rel = rel.unwrap_or_else(|| abs.to_path_buf());
-        rel.to_string_lossy().replace('\\', "/")
-    }
-
     fn stage_path(&self, path: &str) -> StoreResult<()> {
         let rel = path.trim_start_matches('/');
         let repo = self

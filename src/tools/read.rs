@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::audit::AuditLog;
 use crate::bundle::repo::BundleRepo;
 use crate::bundle::types::*;
 use crate::config::BundleBackend;
@@ -9,19 +8,16 @@ use crate::config::BundleBackend;
 pub struct ReadTools {
     bundles: HashMap<String, Arc<BundleRepo>>,
     backends: HashMap<String, BundleBackend>,
-    audit: Option<Arc<AuditLog>>,
 }
 
 impl ReadTools {
     pub fn new(
         bundles: HashMap<String, Arc<BundleRepo>>,
         backends: HashMap<String, BundleBackend>,
-        audit: Option<Arc<AuditLog>>,
     ) -> Self {
         Self {
             bundles,
             backends,
-            audit,
         }
     }
 
