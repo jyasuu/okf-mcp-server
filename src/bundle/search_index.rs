@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use cang_jie::{CangJieTokenizer, TokenizerOption, CANG_JIE};
+use jieba_rs::Jieba;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
@@ -49,6 +51,12 @@ impl SearchIndex {
 
         let index = Index::create_in_dir(index_dir, schema.clone())
             .map_err(|e| format!("failed to create tantivy index: {e}"))?;
+
+        let tokenizer = CangJieTokenizer {
+            worker: Arc::new(Jieba::new()),
+            option: TokenizerOption::Default { hmm: false },
+        };
+        index.tokenizers().register(CANG_JIE, tokenizer);
 
         let writer = index
             .writer(50_000_000)

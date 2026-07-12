@@ -610,3 +610,46 @@ fn test_search_index_fallback() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].concept_id, "products");
 }
+
+#[test]
+fn test_search_cjk() {
+    let (_dir, repo) = setup_test_bundle("test");
+
+    let orders = Concept {
+        id: ConceptId::new("tables/orders"),
+        frontmatter: Frontmatter {
+            r#type: "Table".to_string(),
+            title: Some("订单管理".to_string()),
+            description: Some("客户订单记录".to_string()),
+            resource: None,
+            tags: Some(vec!["billing".to_string()]),
+            timestamp: None,
+            extra: serde_yaml::Mapping::new(),
+        },
+        body: "这是订单数据表。".to_string(),
+    };
+    let customers = Concept {
+        id: ConceptId::new("tables/customers"),
+        frontmatter: Frontmatter {
+            r#type: "Table".to_string(),
+            title: Some("客户信息".to_string()),
+            description: Some("客户主数据".to_string()),
+            resource: None,
+            tags: Some(vec!["crm".to_string()]),
+            timestamp: None,
+            extra: serde_yaml::Mapping::new(),
+        },
+        body: "客户主数据表。".to_string(),
+    };
+    repo.write_concept(orders, WriteMode::Create).unwrap();
+    repo.write_concept(customers, WriteMode::Create).unwrap();
+
+    let results = repo.search("订单", None, None).unwrap();
+    assert!(results.iter().any(|r| r.concept_id == "tables/orders"));
+
+    let results = repo.search("客户", None, None).unwrap();
+    assert!(results.iter().any(|r| r.concept_id == "tables/customers"));
+
+    let results = repo.search("数据", None, None).unwrap();
+    assert_eq!(results.len(), 2);
+}

@@ -1092,10 +1092,11 @@ fn compute_relevance_score(
     }
 
     // Body match count — skip the metadata prefix: "{id} {title} {description} {tags} "
-    let prefix_len = 1 + title.len() + 1 + description.len() + 1 + tags.len() + 1;
-    if prefix_len < full_text.len() {
-        let body = &full_text[prefix_len..].to_lowercase();
-        let count = body.matches(query).count();
+    let prefix_chars = 1 + title.chars().count() + 1 + description.chars().count() + 1 + tags.chars().count() + 1;
+    if prefix_chars < full_text.chars().count() {
+        let body: String = full_text.chars().skip(prefix_chars).collect();
+        let body_lower = body.to_lowercase();
+        let count = body_lower.matches(query).count();
         score += count as f64 * 1.0;
     }
 
