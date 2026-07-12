@@ -44,6 +44,40 @@ Path-based access control for write operations using glob patterns (`*`, `**`, `
 ### Audit Logging
 All mutating tools are audited to a single `audit.jsonl` file in the configured `audit_dir`.
 
+## Installation
+
+### Quick install (curl)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jyasuu/okf-mcp-server/main/scripts/install.sh | bash
+```
+
+Or install a specific version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jyasuu/okf-mcp-server/main/scripts/install.sh | bash -s v0.4.0
+```
+
+### Quick install (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/jyasuu/okf-mcp-server/main/scripts/install.ps1 | iex
+```
+
+### Custom install directory
+
+```bash
+OKF_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/jyasuu/okf-mcp-server/main/scripts/install.sh | bash
+```
+
+### Build from source
+
+```bash
+git clone https://github.com/jyasuu/okf-mcp-server.git
+cd okf-mcp-server
+cargo build --release
+```
+
 ## Running
 
 The server uses stdin/stdout transport (no CLI args). Configure via environment variables or a TOML config file:
