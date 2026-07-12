@@ -315,7 +315,7 @@ impl OkfServer {
             ),
             make_tool(
                 "okf_list_concepts",
-                "List concepts in a bundle, optionally filtered by prefix, type, or tag",
+                "List concepts in a bundle. Filter by prefix (path prefix like 'tables/'), concept_type (e.g. Table, View, Metric), or tag.",
                 Self::tool_schema::<ListConceptsArgs>(),
             ),
             make_tool(
@@ -330,7 +330,7 @@ impl OkfServer {
             ),
             make_tool(
                 "okf_search",
-                "Search concepts in a bundle by query text",
+                "Search concepts by query text. Optionally filter by concept_type (Table, View, etc.) or tag.",
                 Self::tool_schema::<SearchArgs>(),
             ),
             make_tool(
@@ -350,7 +350,7 @@ impl OkfServer {
             ),
             make_tool(
                 "okf_write_concept",
-                "Write a concept to a bundle (supports body_sections with replace/merge mode)",
+                "Write a concept to a bundle. The 'data' param is a JSON string with fields: type (required, e.g. Table, View, Metric, Document), title, description, resource, tags (array of strings or comma-separated string), timestamp, body (markdown content), body_sections (array of {heading, content}), body_section_mode (replace or merge), mode (create, update, or upsert).",
                 Self::tool_schema::<WriteConceptArgs>(),
             ),
             make_tool(
@@ -756,22 +756,96 @@ impl OkfServer {
         let data: serde_json::Value = serde_json::from_str(&a.data)
             .map_err(|e| ErrorData::invalid_params(format!("invalid data JSON: {e}"), None::<serde_json::Value>))?;
 
-        let r#type = data.get("type").and_then(|v| v.as_str()).unwrap_or("Concept").to_string();
-        let title = data.get("title").and_then(|v| v.as_str()).map(String::from);
-        let description = data.get("description").and_then(|v| v.as_str()).map(String::from);
-        let resource = data.get("resource").and_then(|v| v.as_str()).map(String::from);
-        let timestamp = data.get("timestamp").and_then(|v| v.as_str()).map(String::from);
-        let tags = data.get("tags").and_then(|v| {
-            v.as_array().map(|arr| {
-                arr.iter()
-                    .filter_map(|t| t.as_str().map(String::from))
-                    .collect::<Vec<_>>()
-            })
-            .or_else(|| v.as_str().map(|s| {
-                s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()
-            }))
-        });
-        let mode = data.get("mode").and_then(|v| v.as_str()).unwrap_or("upsert").to_string();
+        if !data.is_object() {
+            return Err(ErrorData::invalid_params("data must be a JSON object", None::<serde_json::Value>));
+        }
+
+        let r#type = data.get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ErrorData::invalid_params("data.type is required and must be a string", None::<serde_json::Value>))?;
+        if r#type.is_empty() {
+            return Err(ErrorData::invalid_params("data.type must not be empty", None::<serde_json::Value>));
+        }
+
+        if let Some(t) = data.get("title") {
+            if !t.is_string() {
+                return Err(ErrorData::invalid_params("data.title must be a string", None::<serde_json::Value>));
+            }
+        }
+        if let Some(d) = data.get("description") {
+            if !d.is_string() {
+                return Err(ErrorData::invalid_params("data.description must be a string", None::<serde_json::Value>));
+            }
+        }
+        if let Some(r) = data.get("resource") {
+            if !r.is_string() {
+                return Err(ErrorData::invalid_params("data.resource must be a string", None::<serde_json::Value>));
+            }
+        }
+        if let Some(ts) = data.get("timestamp") {
+            if !ts.is_string() {
+                return Err(ErrorData::invalid_params("data.timestamp must be a string", None::<serde_json::Value>));
+            }
+        }
+        if let Some(tags_val) = data.get("tags") {
+            match tags_val {
+                serde_json::Value::Array(arr) => {
+                    for t in arr {
+                        if !t.is_string() {
+                            return Err(ErrorData::invalid_params("data.tags array elements must be strings", None::<serde_json::Value>));
+                        }
+                    }
+                }
+                serde_json::Value::String(_) => {}
+                _ => {
+                    return Err(ErrorData::invalid_params("data.tags must be an array of strings or a comma-separated string", None::<serde_json::Value>));
+                }
+            }
+        }
+
+        let mode = data.get("mode").and_then(|v| v.as_str()).unwrap_or("upsert");
+        if !matches!(mode, "create" | "update" | "upsert") {
+            return Err(ErrorData::invalid_params(
+                format!("data.mode must be 'create', 'update', or 'upsert', got '{mode}'"),
+                None::<serde_json::Value>,
+            ));
+        }
+
+        if let Some(bsm) = data.get("body_section_mode") {
+            let v = bsm.as_str().ok_or_else(|| {
+                ErrorData::invalid_params("data.body_section_mode must be a string", None::<serde_json::Value>)
+            })?;
+            if !matches!(v, "replace" | "merge") {
+                return Err(ErrorData::invalid_params(
+                    format!("data.body_section_mode must be 'replace' or 'merge', got '{v}'"),
+                    None::<serde_json::Value>,
+                ));
+            }
+        }
+
+        if let Some(sections) = data.get("body_sections") {
+            let arr = sections.as_array().ok_or_else(|| {
+                ErrorData::invalid_params("data.body_sections must be an array", None::<serde_json::Value>)
+            })?;
+            for (i, s) in arr.iter().enumerate() {
+                let obj = s.as_object().ok_or_else(|| {
+                    ErrorData::invalid_params(format!("data.body_sections[{i}] must be an object"), None::<serde_json::Value>)
+                })?;
+                if !obj.contains_key("heading") || !obj.get("heading").and_then(|v| v.as_str()).is_some() {
+                    return Err(ErrorData::invalid_params(
+                        format!("data.body_sections[{i}].heading is required and must be a string"),
+                        None::<serde_json::Value>,
+                    ));
+                }
+                if !obj.contains_key("content") || !obj.get("content").and_then(|v| v.as_str()).is_some() {
+                    return Err(ErrorData::invalid_params(
+                        format!("data.body_sections[{i}].content is required and must be a string"),
+                        None::<serde_json::Value>,
+                    ));
+                }
+            }
+        }
+
         let body = data.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let body_section_mode = data.get("body_section_mode").and_then(|v| v.as_str()).map(String::from);
         let body_sections = data.get("body_sections").and_then(|v| {
@@ -787,12 +861,21 @@ impl OkfServer {
         });
 
         let fm = Frontmatter {
-            r#type,
-            title,
-            description,
-            resource,
-            tags,
-            timestamp,
+            r#type: r#type.to_string(),
+            title: data.get("title").and_then(|v| v.as_str()).map(String::from),
+            description: data.get("description").and_then(|v| v.as_str()).map(String::from),
+            resource: data.get("resource").and_then(|v| v.as_str()).map(String::from),
+            tags: data.get("tags").and_then(|v| {
+                v.as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| t.as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                })
+                .or_else(|| v.as_str().map(|s| {
+                    s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()
+                }))
+            }),
+            timestamp: data.get("timestamp").and_then(|v| v.as_str()).map(String::from),
             extra: serde_yaml::Mapping::new(),
         };
         self.write_tools
