@@ -350,7 +350,7 @@ impl OkfServer {
             ),
             make_tool(
                 "okf_write_concept",
-                "Write a concept to a bundle. The 'data' param is a JSON string with fields: type (required, e.g. Table, View, Metric, Document), title, description, resource, tags (array of strings or comma-separated string), timestamp, body (markdown content), body_sections (array of {heading, content}), body_section_mode (replace or merge), mode (create, update, or upsert).",
+                "Write a concept to a bundle. The 'data' param is a JSON string with fields: type (required), title, description, resource, tags (array or comma-separated string), timestamp, body (markdown), body_sections (array of {heading, content}), body_section_mode (replace|merge), mode (create|update|upsert, default upsert).",
                 Self::tool_schema::<WriteConceptArgs>(),
             ),
             make_tool(
